@@ -348,6 +348,8 @@ export class Batch {
 	}
 
 	#is_deferred() {
+		if (!async_mode_flag) return false;
+
 		if (this.is_fork) return true;
 
 		for (const effect of this.#pending.keys()) {
@@ -392,6 +394,8 @@ export class Batch {
 	 * @param {Effect | null} [root]
 	 */
 	is_blocked_by(effect, root = null) {
+		if (!async_mode_flag) return false;
+
 		for (var e = /** @type {Effect | null} */ (effect); e !== null && e !== root; e = e.parent) {
 			if (this.#skips(e)) return false;
 
@@ -692,14 +696,23 @@ export class Batch {
 		// append/remove branches
 		this.#run_callbacks(this.#commit_callbacks);
 
-		var earlier_writes = flush_queued_effects(render_effects);
+		var was_flushing_effects = is_flushing_effects;
+		var previous_captured_writes = captured_writes;
 
-		// the content has been updated, and user effects are about to see it
-		if (custom_renderers_flag && before_effects !== null) {
-			before_effects();
+		try {
+			is_flushing_effects = true;
+			var earlier_writes = flush_queued_effects(render_effects);
+
+			// the content has been updated, and user effects are about to see it
+			if (custom_renderers_flag && before_effects !== null) {
+				before_effects();
+			}
+
+			flush_queued_effects(effects, earlier_writes);
+		} finally {
+			is_flushing_effects = was_flushing_effects;
+			captured_writes = previous_captured_writes;
 		}
-
-		flush_queued_effects(effects, earlier_writes);
 
 		this.#deferred?.resolve();
 
@@ -741,6 +754,8 @@ export class Batch {
 	 * @param {Iterable<Source>} sources
 	 */
 	#revalidate(sources) {
+		if (!async_mode_flag) return;
+
 		// deriveds added during iteration are visited too, so this doubles as a worklist
 		/** @type {Set<Value>} */
 		var values = new Set(sources);
@@ -1011,6 +1026,10 @@ export class Batch {
 
 		this.current.set(source, entry);
 
+		if (is_flushing_effects) {
+			(captured_writes ??= new Set()).add(source);
+		}
+
 		// The active view of the world sees writes made while it's active, even if they don't belong to the batch whose
 		// view it is — e.g. those of effects that run while a batch commits, which go to a new batch. (Async results
 		// are only captured while no view is active, see `async_derived`)
@@ -1094,6 +1113,8 @@ export class Batch {
 	}
 
 	#commit() {
+		if (!async_mode_flag) return;
+
 		// If there are other pending batches, they now need to be 'rebased' —
 		// in other words, their view of the world now includes the newly committed
 		// state (unless the batch in question has a more recent value for a given source),
@@ -1166,6 +1187,8 @@ export class Batch {
 	 * If it has pending work it stays linked, coming first from now on (see `#move_to_front`)
 	 */
 	commit_writes() {
+		if (!async_mode_flag) return;
+
 		this.#commit();
 		if (this.linked && this.prev !== null) this.#move_to_front();
 	}
@@ -1174,6 +1197,8 @@ export class Batch {
 	 * @param {Effect} effect
 	 */
 	increment(effect) {
+		if (!async_mode_flag) return;
+
 		var count = this.#pending.get(effect) ?? 0;
 		this.#pending.set(effect, count + 1);
 	}
@@ -1182,6 +1207,8 @@ export class Batch {
 	 * @param {Effect} effect
 	 */
 	decrement(effect) {
+		if (!async_mode_flag) return;
+
 		var count = this.#pending.get(effect) ?? 0;
 
 		if (count === 1) {
@@ -1515,6 +1542,8 @@ export class Batch {
 	 * on: This ensures logic about who sees what values in intersects/merge/etc work correctly.
 	 */
 	#move_to_front() {
+		if (!async_mode_flag) return;
+
 		var prev = /** @type {Batch} */ (this.prev);
 		var first = /** @type {Batch} */ (first_batch);
 
@@ -1645,6 +1674,15 @@ function infinite_loop_guard() {
 	}
 }
 
+var is_flushing_effects = false;
+
+/**
+ * Sources captured since the last effect in `flush_queued_effects` finished, including
+ * writes by its eager block reruns. Nested flushes use their own collector.
+ * @type {Set<Value> | null}
+ */
+var captured_writes = null;
+
 /** @type {Set<Effect> | null} */
 export let eager_block_effects = null;
 
@@ -1772,15 +1810,19 @@ function flush_queued_effects(effects, earlier_writes = null) {
 				}
 			}
 
-			// if the effect — or the block effects — wrote anything
-			if (write_version !== version && current_batch !== null) {
-				for (const [value, write] of current_batch.current) {
-					if (write.wv > version) {
+			// Only visit sources captured by this effect or its eager block reruns.
+			// A nested flush may have drained their batch, so use the current entry.
+			if (write_version !== version && current_batch !== null && captured_writes !== null) {
+				for (const value of captured_writes) {
+					var write = current_batch.current.get(value);
+					if (write !== undefined && write.wv > version) {
 						(earlier_writes ??= new Map()).set(value, write);
 					}
 				}
 			}
 		}
+
+		captured_writes?.clear();
 	}
 
 	eager_block_effects = null;
