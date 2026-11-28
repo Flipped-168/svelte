@@ -176,7 +176,62 @@ export function set_update_version(value) {
 	update_version = value;
 }
 
-export function increment_write_version() {
+/** Number of dependency checks in an outermost derived read, or 0 outside one. */
+let checked_deps = 0;
+
+/**
+ * Successfully checked disconnected deriveds, valid only within that read: `null` for a check in the real world,
+ * else what `get_view` resolved in the active view (which doesn't change during a read) — which the view's cache
+ * can't hold, since nothing would remove it when it becomes stale. With the version it had, since it can be the
+ * derived itself (its global state applies), whose run a real-world evaluation can replace
+ * @type {Map<Derived, { entry: Derived | DerivedRecord | BatchValue, wv: number } | null> | null}
+ */
+export let derived_checks = null;
+
+/** Explicit writes can invalidate checks even before the memo is allocated. */
+export let derived_checks_version = 0;
+
+export function invalidate_derived_checks() {
+	if (checked_deps !== 0) {
+		derived_checks?.clear();
+		derived_checks_version++;
+	}
+}
+
+/** End an outermost derived read (see `get`) */
+function end_derived_checks() {
+	checked_deps = 0;
+	derived_checks = null;
+}
+
+/**
+ * What `get_view` resolved for a disconnected derived earlier in the current outermost derived read, if anything
+ * @param {Derived} derived
+ * @returns {Derived | DerivedRecord | BatchValue | undefined}
+ */
+export function get_view_check(derived) {
+	if (derived_checks === null) return;
+
+	var check = derived_checks.get(derived);
+	if (check && check.entry.wv === check.wv) return check.entry;
+}
+
+/**
+ * Remember what `get_view` resolved for a disconnected derived, unless an explicit write happened since it
+ * started (`version` is the `derived_checks_version` from then), which may have invalidated what it read
+ * @param {Derived} derived
+ * @param {Derived | DerivedRecord | BatchValue} entry
+ * @param {number} version
+ */
+export function set_view_check(derived, entry, version) {
+	if (derived_checks !== null && version === derived_checks_version) {
+		derived_checks.set(derived, { entry, wv: entry.wv });
+	}
+}
+
+/** @param {boolean} [is_derived] A computed result, rather than an explicit write (including a derived assignment). */
+export function increment_write_version(is_derived = false) {
+	if (!is_derived) invalidate_derived_checks();
 	return ++write_version;
 }
 
@@ -206,6 +261,14 @@ export function version_of(signal) {
  */
 export function is_current(deps, dv) {
 	if (deps !== null) {
+		// Within an outermost derived read in a batch's view, as in `is_dirty` for the real world: only pay
+		// for a memo once repeated paths through the graph might be expensive (see `get_view_check`)
+		if (checked_deps !== 0 && batch_values !== null) {
+			checked_deps += dv.length;
+
+			if (checked_deps > 100000) derived_checks ??= new Map();
+		}
+
 		for (var i = 0; i < dv.length; i++) {
 			if (version_of(deps[i]) !== dv[i]) return false;
 		}
@@ -318,12 +381,42 @@ export function is_dirty(reaction) {
 		if (dv === null) return true;
 
 		if (batch_values === null) {
+			var checking = checked_deps !== 0;
+			var checks_version = derived_checks_version;
+
+			if (checking) {
+				checked_deps += dv.length;
+				// As in Batch#mark, only pay for a memo once repeated paths through the graph
+				// might be expensive. Small derived reads don't allocate a memo.
+				if (checked_deps > 100000) {
+					derived_checks ??= new Map();
+					if (
+						(flags & CONNECTED) === 0 &&
+						derived_checks.get(/** @type {Derived} */ (reaction)) === null
+					) {
+						return false;
+					}
+				}
+			}
+
 			for (var i = 0, length = dv.length; i < length; i++) {
 				var dependency = /** @type {Value[]} */ (deps)[i];
 
 				update_derived(dependency);
 
 				if (dependency.wv !== dv[i]) return true;
+			}
+
+			// A write may have invalidated dependencies we already visited. Clearing the
+			// memo alone wouldn't stop this in-flight check from adding a stale result.
+			if (
+				checking &&
+				(flags & (CONNECTED | DERIVED)) === DERIVED &&
+				checks_version === derived_checks_version
+			) {
+				// The memo may have been allocated while checking a dependency. Disconnected
+				// deriveds must stay MAYBE_DIRTY, but need not be checked once per path.
+				derived_checks?.set(/** @type {Derived} */ (reaction), null);
 			}
 		} else if (!is_current(deps, dv)) {
 			return true;
@@ -372,6 +465,15 @@ function schedule_possible_effect_self_invalidation(signal, effect, root = true)
 export let abort_controller = null;
 
 /**
+ * Whether `getAbortSignal()` was ever called. Until then `abort_controller` is `null`, no reaction has the
+ * `HAS_ABORT_CONTROLLER` flag, and every `ac` (of reactions and of batch records) is `null`/`undefined`, so
+ * code that handles abort signals can be skipped. Since this is only assigned in `get_abort_signal`, bundlers
+ * treat it as `false` when that isn't bundled, and remove the abort-signal handling it guards from apps that
+ * don't use `getAbortSignal()`. It must be the first operand of those guards so that they can be folded away
+ */
+export let abort_signals_used = false;
+
+/**
  * The signal of the run of `reaction` that is in progress. Its controller is stored with the run once it's done
  * (see `set_global_signal` and `update_record`) — `reaction.ac` is the previous global run's until then
  * @param {Reaction} reaction
@@ -383,6 +485,7 @@ export function get_abort_signal(reaction) {
 		e.get_abort_signal_after_await();
 	}
 
+	abort_signals_used = true;
 	reaction.f |= HAS_ABORT_CONTROLLER;
 
 	return (abort_controller ??= new AbortController()).signal;
@@ -390,7 +493,9 @@ export function get_abort_signal(reaction) {
 
 /** @param {AbortController | null | undefined} controller */
 function abort_signal(controller) {
-	if (controller) without_reactive_context(() => controller.abort(STALE_REACTION));
+	if (abort_signals_used && controller) {
+		without_reactive_context(() => controller.abort(STALE_REACTION));
+	}
 }
 
 /**
@@ -402,7 +507,7 @@ function abort_signal(controller) {
  * and the batches that the new run supersedes still hold the record then, but don't count
  */
 export function abort_record(reaction, record, rerun = false) {
-	if (!record?.ac) return;
+	if (!abort_signals_used || !record?.ac) return;
 
 	for (var b = first_batch; b !== null; b = b.next) {
 		if (
@@ -492,7 +597,7 @@ function supersedes(batch, other) {
  * @param {Reaction} reaction
  */
 export function abort_all(reaction) {
-	if ((reaction.f & HAS_ABORT_CONTROLLER) === 0) return false;
+	if (!abort_signals_used || (reaction.f & HAS_ABORT_CONTROLLER) === 0) return false;
 	reaction.f ^= HAS_ABORT_CONTROLLER;
 
 	abort_signal(reaction.ac);
@@ -556,7 +661,7 @@ export function update_reaction(reaction) {
 	var previous_abort_controller = abort_controller;
 	abort_controller = null;
 
-	if ((flags & HAS_ABORT_CONTROLLER) !== 0) {
+	if (abort_signals_used && (flags & HAS_ABORT_CONTROLLER) !== 0) {
 		abort_replaced(reaction, flags);
 	}
 
@@ -633,7 +738,7 @@ export function update_reaction(reaction) {
 	} finally {
 		var signal = /** @type {AbortController | null} */ (abort_controller)?.signal;
 
-		if (batch !== null && signal !== undefined) {
+		if (abort_signals_used && batch !== null && signal !== undefined) {
 			// The reaction that requested the signal identifies the merge target, even if
 			// another reaction awaits its result (e.g. `let promise = $derived(load(...))`).
 			signal.addEventListener('abort', () => {
@@ -692,7 +797,11 @@ function update_dependencies(reaction, flags, value, error) {
 
 	// ...and so can the last reaction of a derived, which aborts the derived's signals, see `remove_reaction`.
 	// `abort_all` removed the flag that the run in progress set, so its signal is still to be aborted
-	if (abort_controller !== null && (reaction.f & HAS_ABORT_CONTROLLER) === 0) {
+	if (
+		abort_signals_used &&
+		abort_controller !== null &&
+		(reaction.f & HAS_ABORT_CONTROLLER) === 0
+	) {
 		abort_signal(abort_controller);
 		abort_controller = null;
 	}
@@ -713,7 +822,12 @@ function update_dependencies(reaction, flags, value, error) {
 
 		// TODO: the run's signal (if any) is never aborted — should we abort when the teardown's view of the
 		// world is done with the run?
-		teardown_run = { v: value, wv, e: error, assigned: (flags & ASSIGNED) !== 0 };
+		teardown_run = {
+			v: value,
+			wv,
+			e: error,
+			assigned: (flags & ASSIGNED) !== 0
+		};
 		return;
 	}
 
@@ -743,7 +857,7 @@ function update_dependencies(reaction, flags, value, error) {
 		if (dv.length !== length) dv.length = length;
 
 		if ((flags & DERIVED) !== 0) set_derived_value(/** @type {Derived} */ (reaction), value, error);
-		if (reaction.ac || abort_controller) set_global_signal(reaction);
+		if (abort_signals_used && (reaction.ac || abort_controller)) set_global_signal(reaction);
 
 		return;
 	}
@@ -763,7 +877,7 @@ function set_derived_value(derived, value, error) {
 
 	if (error || (flags & ERROR_VALUE) !== 0 || !derived.equals(value)) {
 		derived.v = value;
-		derived.wv = increment_write_version();
+		derived.wv = increment_write_version(true);
 		flags = error ? flags | ERROR_VALUE : flags & ~ERROR_VALUE;
 	}
 
@@ -909,7 +1023,7 @@ function update_record(reaction, flags, length, value, error) {
 	} else {
 		reaction.deps = read;
 		reaction.dv = dv;
-		if (reaction.ac || abort_controller) set_global_signal(reaction);
+		if (abort_signals_used && (reaction.ac || abort_controller)) set_global_signal(reaction);
 
 		if ((flags & DERIVED) !== 0) {
 			set_derived_value(/** @type {Derived} */ (reaction), value, error);
@@ -956,29 +1070,28 @@ function keep_global_run(derived, flags) {
 	/** @type {DerivedRecord | undefined} */
 	var record;
 
-	var ac = derived.ac;
+	var ac = abort_signals_used ? derived.ac : null;
 
 	// whether the run's signal stays live, because a fork's view ran the derived (it's only aborted before the
 	// derived runs again if the run was in the real world, see `abort_replaced`)
 	var live = ac !== null && current_batch !== null && current_batch.is_fork && !ac.signal.aborted;
 
 	for (var batch = first_batch; batch !== null; batch = batch.next) {
-		if (
-			batch !== view_batch &&
-			!batch.records?.has(derived) &&
-			// otherwise, the run's signal was aborted when the derived ran again, or is about to be (see `set_global_signal`)
-			(ac === null || live || supersedes(current_batch, batch))
-		) {
-			// All batches that retain this run share one record. (Its versions are copied: the
-			// derived's next global run in the real world updates its own in place)
-			record ??= {
-				deps: derived.deps,
-				dv: dv.slice(),
-				v: derived.v,
-				wv: derived.wv,
-				e: (flags & ERROR_VALUE) !== 0
-			};
-			(batch.records ??= new Map()).set(derived, record);
+		if (batch !== view_batch && !batch.records?.has(derived)) {
+			// otherwise, the run's signal was aborted when the derived ran again, or is about to be (see `set_global_signal`).
+			// (A separate `if`, so that bundlers can remove it when `ac` is always `null`, see `abort_signals_used`)
+			if (ac === null || live || supersedes(current_batch, batch)) {
+				// All batches that retain this run share one record. (Its versions are copied: the
+				// derived's next global run in the real world updates its own in place)
+				record ??= {
+					deps: derived.deps,
+					dv: dv.slice(),
+					v: derived.v,
+					wv: derived.wv,
+					e: (flags & ERROR_VALUE) !== 0
+				};
+				(batch.records ??= new Map()).set(derived, record);
+			}
 		}
 	}
 
@@ -1031,7 +1144,7 @@ function derived_version(derived, batch, value, error) {
 		if ((derived.f & ERROR_VALUE) === 0 && derived.equals(value)) return derived.wv;
 	}
 
-	return increment_write_version();
+	return increment_write_version(true);
 }
 
 /**
@@ -1056,7 +1169,7 @@ export function promote_record(reaction, record) {
 	}
 
 	// the run's signal replaces the global run's (so that dropping the record doesn't abort it, see `Batch#release_records`)
-	abort_signal(reaction.ac);
+	if (abort_signals_used) abort_signal(reaction.ac);
 	reaction.ac = record.ac ?? null;
 	record.ac = null;
 }
@@ -1155,7 +1268,9 @@ function remove_reaction(signal, dependency) {
 
 		// Call abort controller, noone's listening to this derived anymore: no live run of any reaction, in any batch,
 		// read it (the edges cover them all, see `Reaction#edges`). That includes the runs of it that batches hold
-		if (abort_all(derived)) {
+		if (abort_signals_used && abort_all(derived)) {
+			// Disconnected ancestors may have been checked before this run was aborted.
+			invalidate_derived_checks();
 			// ensure it reruns right away next time instead of potentially returning a rejected promise as its value —
 			// in the real world, and in every batch's view (which would otherwise reuse its record of the derived)
 			set_signal_status(derived, DIRTY);
@@ -1426,22 +1541,39 @@ export function get(signal) {
 			derived.f |= CONNECTED;
 		}
 
-		if (batch_values !== null) {
-			view = get_view(derived);
+		if ((flags & CONNECTED) === 0 && !is_new && checked_deps === 0) {
+			// Untracked reads and reads that reconnect the graph check disconnected deriveds, which aren't marked
+			// clean once checked: deduplicate them, so that they aren't checked once per path (see `derived_checks`).
+			// A derived that was connected before the read only reads connected deriveds, so reads of connected
+			// deriveds — the hot path — don't pay for this
+			checked_deps = 1;
 
-			// the view doesn't cache a disconnected derived, so the run that reads it
-			// remembers which version it saw (see `seen_version`)
-			if (
-				(derived.f & CONNECTED) === 0 &&
-				active_reaction !== null &&
-				!untracking &&
-				(active_reaction.f & REACTION_IS_UPDATING) !== 0
-			) {
-				var seen = (view_read_versions ??= new Map()).get(derived);
-				view_read_versions.set(derived, seen === undefined || seen === view.wv ? view.wv : -1);
+			try {
+				if (batch_values === null) {
+					update_derived(derived);
+				} else {
+					view = get_view(derived);
+				}
+			} finally {
+				end_derived_checks();
 			}
-		} else {
+		} else if (batch_values === null) {
 			update_derived(derived);
+		} else {
+			view = get_view(derived);
+		}
+
+		// the view doesn't cache a disconnected derived, so the run that reads it
+		// remembers which version it saw (see `seen_version`)
+		if (
+			view !== undefined &&
+			(derived.f & CONNECTED) === 0 &&
+			active_reaction !== null &&
+			!untracking &&
+			(active_reaction.f & REACTION_IS_UPDATING) !== 0
+		) {
+			var seen = (view_read_versions ??= new Map()).get(derived);
+			view_read_versions.set(derived, seen === undefined || seen === view.wv ? view.wv : -1);
 		}
 
 		if (should_connect && !is_new) {
